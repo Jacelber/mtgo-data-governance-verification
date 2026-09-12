@@ -83,24 +83,33 @@ def prepare(site: Path, destination: Path, *, target: str, source: str) -> dict:
         content_digest = hashlib.sha256()
         with package.open("wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as zipped:
             with tarfile.open(fileobj=zipped, mode="w|") as archive:
+                # Match the root-relative tree emitted by the official Pages
+                # tar command. Include parent directories with explicit modes.
+                root_entry = tarfile.TarInfo(".")
+                root_entry.type, root_entry.mode, root_entry.mtime = tarfile.DIRTYPE, 0o755, 0
+                archive.addfile(root_entry)
                 for path in sorted(site.rglob("*")):
                     if path.is_symlink():
                         raise ValueError("Site contains a link")
                     if path.is_dir():
+                        directory = tarfile.TarInfo("./" + safe_name(path.relative_to(site).as_posix()))
+                        directory.type, directory.mode, directory.mtime = tarfile.DIRTYPE, 0o755, 0
+                        archive.addfile(directory)
                         continue
                     if not path.is_file():
                         raise ValueError("Site contains a special file")
                     if path.relative_to(site).as_posix() == VERSION_FILE:
                         continue  # A new candidate gets a marker for its actual selected bytes.
-                    info = archive.gettarinfo(str(path), arcname=safe_name(path.relative_to(site).as_posix()))
-                    content_digest.update(info.name.encode() + b"\0" + sha256(path).encode() + b"\0")
+                    relative = safe_name(path.relative_to(site).as_posix())
+                    info = archive.gettarinfo(str(path), arcname="./" + relative)
+                    content_digest.update(relative.encode() + b"\0" + sha256(path).encode() + b"\0")
                     info.uid = info.gid = info.mtime = 0
                     info.uname = info.gname = ""
                     info.mode = 0o644
                     with path.open("rb") as handle:
                         archive.addfile(info, handle)
                 marker = json.dumps({"content_sha256": content_digest.hexdigest()}, sort_keys=True).encode() + b"\n"
-                info = tarfile.TarInfo(VERSION_FILE)
+                info = tarfile.TarInfo("./" + VERSION_FILE)
                 info.size, info.mode, info.mtime = len(marker), 0o644, 0
                 archive.addfile(info, io.BytesIO(marker))
         manifest = describe(package, target=target, source=source)
