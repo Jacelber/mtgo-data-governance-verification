@@ -32,11 +32,24 @@ class Pages:
                 if expected is not None:
                     raise Conflict("Another deployment changed the production base")
                 return {"id": str(record["id"]), "sha": record["sha"], "state": "success"}
+            if status["state"] in {"failure", "error"} and self.no_send_job(link):
+                continue
             if status["state"] != "inactive":
                 raise Conflict("Unresolved or external deployment exists; inspect its actual effects")
         if expected is not None:
             raise Conflict("Recorded deployment cannot be located in current platform facts")
         return None
+
+    def no_send_job(self, log_url: str) -> bool:
+        """An environment record can fail BEFORE any Pages request was sent."""
+        match = re.search(r"/actions/runs/(\d+)/job/(\d+)$", log_url)
+        if not match:
+            return False
+        job = self.client.api(f"repos/{self.repository}/actions/jobs/{match[2]}")
+        if job["name"] != "Deploy selected product" or job["status"] != "completed":
+            return False
+        sends = [step for step in job.get("steps", []) if step["name"] == "Send selected package once"]
+        return len(sends) == 1 and sends[0]["conclusion"] == "skipped"
 
     def operation_record(self, run: str, attempt: str) -> str | None:
         jobs = self.client.api(f"repos/{self.repository}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100")["jobs"]
