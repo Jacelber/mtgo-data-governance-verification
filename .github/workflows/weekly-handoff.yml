@@ -1,0 +1,61 @@
+name: Verify encrypted private business handoff
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+concurrency:
+  group: verify-private-weekly-handoff
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Create synthetic review material without credentials
+      run: 'mkdir -p "$RUNNER_TEMP/weekly-maintenance-readiness"
+
+        printf ''%s\n'' ''{"document_type":"weekly_maintenance_readiness","synthetic":true,"records":[]}''
+        > "$RUNNER_TEMP/weekly-maintenance-readiness/readiness.json"'
+    - name: Encrypt the private weekly handoff without write credentials
+      env:
+        CERTIFICATE: ${{ vars.ARCHIVE_HANDOFF_CERT }}
+      run: "printf '%s' \"$CERTIFICATE\" > \"$RUNNER_TEMP/weekly-handoff-public.pem\"\
+        \nopenssl cms -encrypt -binary -stream -outform DER -aes-256-gcm \\\n  -in\
+        \ \"$RUNNER_TEMP/weekly-maintenance-readiness/readiness.json\" \\\n  -out\
+        \ \"$RUNNER_TEMP/weekly-maintenance-readiness/readiness.cms\" \\\n  -recip\
+        \ \"$RUNNER_TEMP/weekly-handoff-public.pem\" \\\n  -keyopt rsa_padding_mode:oaep\
+        \ -keyopt rsa_oaep_md:sha256\n"
+    - uses: actions/upload-artifact@v4.6.2
+      with:
+        name: encrypted-weekly-handoff
+        path: ${{ runner.temp }}/weekly-maintenance-readiness/readiness.cms
+        retention-days: 1
+  retain:
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: product-archive
+    steps:
+    - uses: actions/download-artifact@v4.3.0
+      with:
+        name: encrypted-weekly-handoff
+        path: ${{ runner.temp }}/weekly-maintenance-readiness
+    - name: Decrypt and retain the business handoff in the private archive
+      env:
+        HANDOFF_KEY: ${{ secrets.ARCHIVE_HANDOFF_KEY }}
+        GH_TOKEN: ${{ secrets.ARCHIVE_TOKEN }}
+      run: "umask 077\nKEY=\"$RUNNER_TEMP/weekly-handoff-key.pem\"\ntrap 'rm -f \"\
+        $KEY\"' EXIT\nprintf '%s' \"$HANDOFF_KEY\" > \"$KEY\"\nREPORT=\"$RUNNER_TEMP/weekly-maintenance-readiness/readiness.json\"\
+        \nopenssl cms -decrypt -binary -inform DER \\\n  -in \"$RUNNER_TEMP/weekly-maintenance-readiness/readiness.cms\"\
+        \ \\\n  -inkey \"$KEY\" -out \"$REPORT\"\npython -c 'import json,sys; d=json.load(open(sys.argv[1],\
+        \ encoding=\"utf-8\")); assert d[\"document_type\"] == \"weekly_maintenance_readiness\"\
+        ' \"$REPORT\"\nARCHIVE=Jacelber/mtgo-data-releases\ntest \"$(gh api \"repos/$ARCHIVE\"\
+        \ --jq .private)\" = true\nDIGEST=\"$(sha256sum \"$REPORT\" | awk '{print\
+        \ $1}')\"\nTAG=\"verification-weekly-readiness-${GITHUB_RUN_ID}-${DIGEST:0:16}\"\
+        \n# A lost create response is resolved by reading the same immutable object.\n\
+        if ! gh release view \"$TAG\" --repo \"$ARCHIVE\" >/dev/null 2>&1; then\n\
+        \  gh release create \"$TAG\" \"$REPORT\" --repo \"$ARCHIVE\" --draft \\\n\
+        \    --title \"Private weekly review handoff $GITHUB_RUN_ID\" --notes \"Business\
+        \ review material; not a deployable or recovery package.\" || true\nfi\ngh\
+        \ release download \"$TAG\" --repo \"$ARCHIVE\" --pattern readiness.json --output\
+        \ \"$RUNNER_TEMP/weekly-handoff-returned.json\"\ncmp \"$REPORT\" \"$RUNNER_TEMP/weekly-handoff-returned.json\"\
+        \necho \"Private handoff: https://github.com/$ARCHIVE/releases/tag/$TAG\"\
+        \ >> \"$GITHUB_STEP_SUMMARY\"\n"

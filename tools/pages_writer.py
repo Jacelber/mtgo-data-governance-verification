@@ -48,6 +48,8 @@ def main() -> int:
     sub.add_parser("status", help="Read control and remote operation state")
     sub.add_parser("cancel", help="Request remote cancellation; retain unresolved state")
     sub.add_parser("settle-unsent", help="Clear a completed attempt only when the platform proves it never sent")
+    settled = sub.add_parser("settle-completed", help="Record uncertain served content after a proven completed write; never decide rollback")
+    settled.add_argument("--candidate", type=Path, required=True)
     end = sub.add_parser("end-recovery", help="End a resolved, withdrawn or inapplicable recovery intent")
     end.add_argument("--reason", required=True)
     problem = sub.add_parser("problem", help="Record a confirmed defect of the actual current product")
@@ -149,6 +151,35 @@ def main() -> int:
             state = transitions.no_write(state, args.operation, terminal_without_write=True)
             archive.save_state(state, sha)
             result = {"state": "not_sent", "operation": args.operation, "recovery": state["recovery"]}
+        elif args.command == "settle-completed":
+            pending = state["pending"]
+            if not pending or pending["operation"] != args.operation or not pending.get("remote"):
+                raise transitions.Conflict("The actual remote request must already be identified")
+            remote = pending["remote"]
+            platform_status = pages.query(remote["pages_id"]).get("status")
+            if platform_status not in {"succeed", "deployment_failed", "cancelled", "canceled"}:
+                raise transitions.Conflict("Remote write is not proven complete")
+            record = pages.operation_record(pending["run"], pending["attempt"])
+            if not record or (remote.get("deployment_id") and record != remote["deployment_id"]):
+                raise transitions.Conflict("Completed write does not match the recorded operation")
+            pages.current(expected=record, own_run=os.environ.get("GITHUB_RUN_ID"))
+            manifest = json.loads((args.candidate / "manifest.json").read_text(encoding="utf-8"))
+            packages.verify(args.candidate / "product.tar.gz", manifest, target=args.target)
+            if manifest["id"] != pending["package"]:
+                raise transitions.Conflict("Observation refers to a different candidate")
+            observation = observe_content(pages.site_url(), manifest, args.operation)
+            bound = {**remote, "deployment_id": record}
+            state["pending"]["remote"] = bound  # Enrich the same identified request, as normal confirmation does.
+            state = transitions.deployed(state, args.operation, bound)
+            state["current"]["platform_status"] = platform_status
+            if platform_status == "succeed" and observation["state"] == "matching":
+                state = transitions.confirmed(state, args.operation, health="passed", observed_operation=args.operation)
+            else:
+                if platform_status != "succeed":
+                    observation = {"state": "unconfirmed", "platform_status": platform_status, "served": observation}
+                state = transitions.end_completed_write(state, args.operation, observation=observation, terminal=True)
+            archive.save_state(state, sha)
+            result = {"state": "write_completed", "platform_status": platform_status, "service": observation, "rollback_requested": False}
         elif args.command == "end-recovery":
             state = transitions.end_recovery(state, args.operation, reason=args.reason)
             archive.save_state(state, sha)

@@ -7,6 +7,7 @@ import os
 import re
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 from tools.delivery.github import APIError, GitHub
 from tools.delivery.state import Conflict
@@ -105,8 +106,12 @@ def observe_content(base_url: str, manifest: dict, operation: str) -> dict:
     for relative, expected in manifest["probes"].items():
         url = f"{base_url.rstrip('/')}/{quote(relative, safe='/')}?delivery={quote(operation, safe='')}"
         request = Request(url, headers={"Cache-Control": "no-cache", "Accept-Encoding": "identity"})
-        with urlopen(request, timeout=30) as response:
-            digest = hashlib.file_digest(response, "sha256").hexdigest()
+        try:
+            with urlopen(request, timeout=30) as response:
+                digest = hashlib.file_digest(response, "sha256").hexdigest()
+        except (OSError, URLError):
+            mismatches.append(relative + " (unavailable; not a confirmed product defect)")
+            continue
         if digest != expected:
             mismatches.append(relative)
     return {"state": "matching" if not mismatches else "unconfirmed", "mismatches": mismatches}

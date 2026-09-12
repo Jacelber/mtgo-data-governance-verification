@@ -150,6 +150,21 @@ def no_write(state: dict, operation: str, *, terminal_without_write: bool) -> di
     return state  # Queue cancellation does not clear recovery intent.
 
 
+def end_completed_write(state: dict, operation: str, *, observation: dict, terminal: bool) -> dict:
+    """Retain uncertain served content after a proven completed platform write."""
+    state = deepcopy(state)
+    pending = _pending(state, operation)
+    if not terminal or pending["phase"] != "confirming" or current_id(state) != operation:
+        raise Conflict("Only the identified completed deployment can end content confirmation")
+    if observation.get("state") != "unconfirmed" or not (observation.get("mismatches") or observation.get("platform_status") in {"deployment_failed", "cancelled", "canceled"}):
+        raise Conflict("Record the actual unconfirmed/mixed service observation")
+    state["current"]["service_observation"] = deepcopy(observation)
+    state["current"]["health"] = "unknown"
+    state["packages"][pending["package"]]["eligible"] = False
+    state["pending"] = None
+    return state  # This neither declares a product defect nor decides to restore.
+
+
 def end_recovery(state: dict, intent: str, *, reason: str) -> dict:
     state = deepcopy(state)
     if state["pending"]:
