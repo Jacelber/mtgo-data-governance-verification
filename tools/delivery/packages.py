@@ -124,6 +124,25 @@ def verify(package: Path, manifest: dict, *, target: str) -> dict:
     return manifest
 
 
+def pages_transport(package: Path, manifest: dict, destination: Path, *, target: str) -> None:
+    """Remove only gzip transport compression; preserve the original complete tar.
+
+    upload-pages-artifact rebuilds a tar and excludes hidden files. Passing this
+    tar to upload-artifact instead preserves the selected product, including its
+    version marker, without a second file-selection step.
+    """
+    verify(package, manifest, target=target)
+    if destination.exists():
+        raise ValueError("Transport destination must be new")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with gzip.open(package, "rb") as source, destination.open("xb") as output:
+            shutil.copyfileobj(source, output)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+
 def extract(package: Path, manifest: dict, destination: Path, *, target: str) -> None:
     verify(package, manifest, target=target)
     destination = destination.resolve()
