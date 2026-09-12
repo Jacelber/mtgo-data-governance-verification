@@ -8,8 +8,10 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import subprocess
 import tarfile
 import tempfile
+import zipfile
 
 MAX_BYTES = 1_000_000_000
 MAX_FILES = 100_000
@@ -175,3 +177,58 @@ def extract(package: Path, manifest: dict, destination: Path, *, target: str) ->
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
+
+
+def seal_candidate(candidate: Path, destination: Path, certificate: Path, *, target: str, openssl: str = "openssl") -> None:
+    """Public Actions handoff carries ciphertext, never an unaccepted product.
+
+    The builder needs only the recipient's public certificate. The private key
+    and archive credential belong solely to the trusted upload environment.
+    CMS encryption does not grant provenance, quality or publication authority.
+    """
+    manifest = json.loads((candidate / "manifest.json").read_text(encoding="utf-8"))
+    verify(candidate / "product.tar.gz", manifest, target=target)
+    if destination.exists():
+        raise ValueError("Encrypted handoff destination must be new")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="handoff-", dir=destination.parent) as temporary:
+        bundle = Path(temporary) / "candidate.zip"
+        encrypted = Path(temporary) / "candidate.cms"
+        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name in ("product.tar.gz", "manifest.json"):
+                archive.write(candidate / name, name)
+        result = subprocess.run([openssl, "cms", "-encrypt", "-binary", "-stream", "-outform", "DER",
+            "-aes-256-gcm", "-recip", str(certificate), "-keyopt", "rsa_padding_mode:oaep",
+            "-keyopt", "rsa_oaep_md:sha256", "-in", str(bundle), "-out", str(encrypted)], capture_output=True)
+        if result.returncode:
+            raise ValueError("Candidate encryption failed; no plaintext handoff may be uploaded")
+        encrypted.rename(destination)
+
+
+def open_candidate(encrypted: Path, destination: Path, private_key: Path, *, target: str, openssl: str = "openssl") -> dict:
+    """Trusted environment only. Decrypt, validate and expose exactly two files."""
+    if destination.exists() or encrypted.stat().st_size > MAX_BYTES + 2_000_000:
+        raise ValueError("Use a new destination and a supported handoff size")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="handoff-", dir=destination.parent) as temporary:
+        root = Path(temporary)
+        bundle = root / "candidate.zip"
+        result = subprocess.run([openssl, "cms", "-decrypt", "-binary", "-inform", "DER",
+            "-inkey", str(private_key), "-in", str(encrypted), "-out", str(bundle)], capture_output=True)
+        if result.returncode:
+            raise ValueError("Candidate decryption or authentication failed")
+        candidate = root / "candidate"
+        candidate.mkdir()
+        with zipfile.ZipFile(bundle) as archive:
+            if sorted(archive.namelist()) != ["manifest.json", "product.tar.gz"]:
+                raise ValueError("Handoff must contain exactly the product package and manifest")
+            for info in archive.infolist():
+                limit = 1_000_000 if info.filename == "manifest.json" else MAX_BYTES
+                if info.file_size > limit or info.compress_type != zipfile.ZIP_STORED:
+                    raise ValueError("Unsupported handoff member size or compression")
+                with archive.open(info) as source, (candidate / info.filename).open("xb") as output:
+                    shutil.copyfileobj(source, output)
+        manifest = json.loads((candidate / "manifest.json").read_text(encoding="utf-8"))
+        verify(candidate / "product.tar.gz", manifest, target=target)
+        candidate.rename(destination)
+        return manifest

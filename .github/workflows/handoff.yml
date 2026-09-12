@@ -1,0 +1,73 @@
+name: Verify encrypted candidate handoff
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: encrypted-handoff-verification
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Create and encrypt synthetic candidate without secrets
+        env:
+          CERTIFICATE: ${{ vars.ARCHIVE_HANDOFF_CERT }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from tools.delivery.packages import prepare, seal_candidate
+          assert not os.environ.get('ARCHIVE_TOKEN')
+          assert not os.environ.get('ARCHIVE_HANDOFF_KEY')
+          Path('sample/index.html').write_text('<!doctype html><title>Synthetic handoff only</title><p>Private transport verification sample</p>')
+          Path('public.pem').write_text(os.environ['CERTIFICATE'])
+          target = 'Jacelber/mtgo-data-governance-verification'
+          prepare(Path('sample'), Path('candidate'), target=target, source='synthetic-encrypted-handoff-v1')
+          seal_candidate(Path('candidate'), Path('handoff.cms'), Path('public.pem'), target=target)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-candidate
+          path: handoff.cms
+          retention-days: 7
+          if-no-files-found: error
+  archive:
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: product-archive
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: encrypted-candidate
+          path: incoming
+      - name: Decrypt and archive the same candidate without executing it
+        env:
+          ARCHIVE_TOKEN: ${{ secrets.ARCHIVE_TOKEN }}
+          ARCHIVE_HANDOFF_KEY: ${{ secrets.ARCHIVE_HANDOFF_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import tempfile
+          from pathlib import Path
+          from tools.delivery.github import GitHub
+          from tools.delivery.packages import open_candidate
+          target = 'Jacelber/mtgo-data-governance-verification'
+          with tempfile.TemporaryDirectory() as temporary:
+              key = Path(temporary) / 'key.pem'
+              key.write_text(os.environ['ARCHIVE_HANDOFF_KEY'])
+              key.chmod(0o600)
+              manifest = open_candidate(Path('incoming/handoff.cms'), Path('candidate'), key, target=target)
+          client = GitHub('Jacelber/mtgo-data-releases', token_env='ARCHIVE_TOKEN', state_path='state/verification-pages.json')
+          result = client.archive(Path('candidate'), target=target)
+          restored = client.retrieve(result['id'], Path('retrieved'), target=target)
+          assert manifest == restored
+          assert Path('candidate/product.tar.gz').read_bytes() == Path('retrieved/product.tar.gz').read_bytes()
+          print('Encrypted handoff and private archive roundtrip confirmed for synthetic content')
+          PY
