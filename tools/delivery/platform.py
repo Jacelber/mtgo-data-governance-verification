@@ -67,6 +67,14 @@ class Pages:
             raise Conflict("Multiple platform operations match this attempt")
         return matching[0] if matching else None
 
+    def attempt_never_sent(self, run: str, attempt: str) -> bool:
+        jobs = self.client.api(f"repos/{self.repository}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100")["jobs"]
+        writers = [job for job in jobs if job["name"] == "Deploy selected product"]
+        if len(writers) != 1 or writers[0]["status"] != "completed":
+            return False
+        sends = [step for step in writers[0].get("steps", []) if step["name"] == "Send selected package once"]
+        return len(sends) == 1 and sends[0]["conclusion"] == "skipped"
+
     def create(self, artifact: int) -> dict:
         oidc_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
         oidc_auth = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")

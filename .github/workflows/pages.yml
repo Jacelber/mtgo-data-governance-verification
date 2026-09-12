@@ -1,4 +1,5 @@
 name: Verify selected product deployment
+run-name: ${{ inputs.operation }} (${{ inputs.mode }})
 on:
   workflow_dispatch:
     inputs:

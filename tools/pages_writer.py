@@ -19,7 +19,8 @@ def context(target: str):
     if target not in {"Jacelber/mtgo-data", "Jacelber/mtgo-data-governance-verification"}:
         raise ValueError("Unsupported deployment target")
     path = "state/pages.json" if target == "Jacelber/mtgo-data" else "state/verification-pages.json"
-    return GitHub("Jacelber/mtgo-data-releases", token_env="ARCHIVE_TOKEN", state_path=path), Pages(target)
+    credential = "ARCHIVE_TOKEN" if os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("ARCHIVE_TOKEN") else None
+    return GitHub("Jacelber/mtgo-data-releases", token_env=credential, state_path=path), Pages(target)
 
 
 def main() -> int:
@@ -44,6 +45,9 @@ def main() -> int:
     resume.add_argument("--wait-seconds", type=int, default=0)
     sub.add_parser("status", help="Read control and remote operation state")
     sub.add_parser("cancel", help="Request remote cancellation; retain unresolved state")
+    sub.add_parser("settle-unsent", help="Clear a completed attempt only when the platform proves it never sent")
+    end = sub.add_parser("end-recovery", help="End a resolved, withdrawn or inapplicable recovery intent")
+    end.add_argument("--reason", required=True)
     problem = sub.add_parser("problem", help="Record a confirmed defect of the actual current product")
     problem.add_argument("--candidate", type=Path, required=True)
     problem.add_argument("--reason", required=True)
@@ -55,14 +59,17 @@ def main() -> int:
         archive.private()
         state, sha = archive.load_state()
         if args.command == "request":
+            info = state["packages"].get(args.package, {})
+            if not info.get("complete") or info.get("target") != args.target:
+                raise transitions.Conflict("Candidate must be completely archived for this target before queueing")
             if args.recovery:
                 state = transitions.request_recovery(state, intent=args.operation, failed_operation=args.base,
                                                      package=args.package, reason=args.reason)
                 archive.save_state(state, sha)
-            elif not state["packages"].get(args.package, {}).get("complete"):
-                raise transitions.Conflict("Candidate must be completely archived before queueing")
             result = {"state": "requested", "operation": args.operation}
         elif args.command == "claim":
+            if state["packages"].get(args.package, {}).get("target") != args.target:
+                raise transitions.Conflict("Candidate belongs to a different deployment target")
             current = state["current"]
             remote = current.get("remote", {}) if current else {}
             expected = remote.get("deployment_id") if isinstance(remote, dict) else remote
@@ -71,8 +78,15 @@ def main() -> int:
                 if not current and actual:
                     raise transitions.Conflict("An existing live deployment requires an explicit initial baseline")
             updated = transitions.claim(state, operation=args.operation, package=args.package, base=args.base or None,
-                                        recovery=args.operation if args.recovery else None)
-            if not state["pending"]:
+                                        recovery=(state["pending"]["recovery"] if state["pending"] and state["pending"]["operation"] == args.operation
+                                                  else args.operation if args.recovery else None))
+            old = state["pending"]
+            run, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+            if old and old["phase"] == "claimed" and (old.get("run"), old.get("attempt")) != (run, attempt):
+                if not pages.attempt_never_sent(old["run"], old["attempt"]):
+                    raise transitions.Conflict("Original claimed attempt may still send; resolve it before continuing")
+                updated["pending"].update(run=run, attempt=attempt)
+            elif not old:
                 updated["pending"].update(run=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"])
             if updated != state:
                 archive.save_state(updated, sha)
@@ -109,11 +123,24 @@ def main() -> int:
             state = transitions.bind_remote(state, args.operation, remote)
             archive.save_state(state, sha)
             result = {"state": "sent", "operation": args.operation, "remote": remote}
+        elif args.command == "settle-unsent":
+            pending = state["pending"]
+            if not pending or pending["operation"] != args.operation or pending["phase"] != "claimed":
+                raise transitions.Conflict("Only a never-sent claimed operation can use this resolution")
+            if not pages.attempt_never_sent(pending["run"], pending["attempt"]):
+                raise transitions.Conflict("The original attempt is not proven completed without a send")
+            state = transitions.no_write(state, args.operation, terminal_without_write=True)
+            archive.save_state(state, sha)
+            result = {"state": "not_sent", "operation": args.operation, "recovery": state["recovery"]}
+        elif args.command == "end-recovery":
+            state = transitions.end_recovery(state, args.operation, reason=args.reason)
+            archive.save_state(state, sha)
+            result = {"state": "recovery_ended", "reason": args.reason}
         elif args.command == "problem":
             current = state["current"]
             if not current or current["operation"] != args.operation or not args.reason.strip():
                 raise transitions.Conflict("Specify the actual current operation and a confirmed defect")
-            pages.current(expected=current["remote"]["deployment_id"])
+            pages.current(expected=current["remote"]["deployment_id"], own_run=os.environ.get("GITHUB_RUN_ID"))
             manifest = json.loads((args.candidate / "manifest.json").read_text())
             packages.verify(args.candidate / "product.tar.gz", manifest, target=args.target)
             if manifest["id"] != current["package"]:
@@ -146,6 +173,12 @@ def main() -> int:
                 result = {"state": "cancel_requested", "remote_stopped": False}
             else:
                 deadline = time.monotonic() + (max(0, min(args.wait_seconds, 600)) if args.command == "resume" else 0)
+                manifest = None
+                if args.command == "resume":
+                    manifest = json.loads((args.candidate / "manifest.json").read_text())
+                    packages.verify(args.candidate / "product.tar.gz", manifest, target=args.target)
+                    if manifest["id"] != pending["package"]:
+                        raise ValueError("Confirmation refers to another package")
                 while True:
                     remote_status = pages.query(pending["remote"]["pages_id"])
                     result = {"state": "unconfirmed", "remote_status": remote_status}
@@ -168,10 +201,6 @@ def main() -> int:
                         state = transitions.deployed(state, args.operation, bound)
                         if json.dumps(state, sort_keys=True) != original:
                             sha = archive.save_state(state, sha)
-                        manifest = json.loads((args.candidate / "manifest.json").read_text())
-                        packages.verify(args.candidate / "product.tar.gz", manifest, target=args.target)
-                        if manifest["id"] != state["current"]["package"]:
-                            raise ValueError("Confirmation refers to another package")
                         observation = observe_content(pages.site_url(), manifest, args.operation)
                         result = {"state": "unconfirmed", **observation}
                         if observation["state"] == "matching":
@@ -179,7 +208,7 @@ def main() -> int:
                             archive.save_state(state, sha)
                             result = {"state": "confirmed", "operation": args.operation, "package": manifest["id"]}
                             break
-                    if args.command == "status" or time.monotonic() >= deadline:
+                    if remote_status.get("status") in {"deployment_failed", "cancelled", "canceled"} or time.monotonic() >= deadline:
                         break
                     time.sleep(5)
         print(json.dumps(result, ensure_ascii=False, indent=2))
