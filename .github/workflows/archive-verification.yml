@@ -1,0 +1,61 @@
+name: Verify archive environments
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: archive-verification
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Prepare synthetic candidate without archive credential
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tools.delivery.packages import prepare
+          prepare(Path("sample"), Path("candidate"), target="Jacelber/mtgo-data-governance-verification", source="synthetic-archive-verification-v1")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: synthetic-candidate
+          path: candidate/
+          retention-days: 1
+          if-no-files-found: error
+  roundtrip:
+    needs: prepare
+    strategy:
+      max-parallel: 1
+      matrix:
+        environment: [product-archive, github-pages]
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: synthetic-candidate
+          path: candidate
+      - name: Archive and retrieve identical synthetic bytes
+        env:
+          ARCHIVE_TOKEN: ${{ secrets.ARCHIVE_TOKEN }}
+        run: |
+          python tools/archive_product.py --target Jacelber/mtgo-data-governance-verification --token-env ARCHIVE_TOKEN upload candidate
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from tools.delivery.github import GitHub
+          manifest = json.loads(Path("candidate/manifest.json").read_text())
+          client = GitHub("Jacelber/mtgo-data-releases", token_env="ARCHIVE_TOKEN", state_path="state/verification-pages.json")
+          found = client.retrieve(manifest["id"], Path("retrieved"), target="Jacelber/mtgo-data-governance-verification")
+          assert found == manifest, "Retrieved candidate differs"
+          state, _ = client.load_state()
+          assert state["packages"][manifest["id"]]["complete"]
+          print(json.dumps({"state": "verified", "package": manifest["id"], "bytes": manifest["bytes"]}))
+          PY

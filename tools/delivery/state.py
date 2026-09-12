@@ -1,0 +1,144 @@
+"""Transitions for one Pages writer; GitHub contents SHA supplies compare-and-swap."""
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+
+
+class Conflict(ValueError):
+    """The write is stale, unresolved, or conflicts with recovery."""
+
+
+def initial() -> dict:
+    return {"schema": 1, "current": None, "previous": None, "pending": None,
+            "recovery": None, "packages": {}}
+
+
+def current_id(state: dict) -> str | None:
+    return state["current"]["operation"] if state["current"] else None
+
+
+def request_recovery(state: dict, *, intent: str, failed_operation: str, package: str, reason: str) -> dict:
+    """Caller must also establish the policy's scope, permission and defect facts."""
+    state = deepcopy(state)
+    current, previous = state["current"], state["previous"]
+    if not reason.strip() or not current or current["operation"] != failed_operation:
+        raise Conflict("Recovery requires the current failed deployment and a concrete reason")
+    if current.get("health") != "failed" or not previous or previous["package"] != package:
+        raise Conflict("Recovery requires the immediately applicable confirmed predecessor")
+    if not state["packages"].get(package, {}).get("eligible", False):
+        raise Conflict("Recovery package is not applicable")
+    recovery = {"id": intent, "failed_operation": failed_operation, "package": package, "reason": reason}
+    if state["recovery"] and state["recovery"] != recovery:
+        raise Conflict("Another recovery intent exists")
+    state["recovery"] = recovery
+    return state
+
+
+def claim(state: dict, *, operation: str, package: str, base: str | None, recovery: str | None = None) -> dict:
+    state = deepcopy(state)
+    pending = state["pending"]
+    if pending:
+        if (pending["operation"], pending["package"], pending["base"], pending["recovery"]) == (operation, package, base, recovery):
+            return state  # Resume means query, not replay an unknown remote request.
+        raise Conflict("An earlier remote write remains unresolved")
+    if base != current_id(state):
+        raise Conflict("Candidate deployment base is stale, including A-B-A")
+    if not state["packages"].get(package, {}).get("complete", False):
+        raise Conflict("Package is not fully archived")
+    intent = state["recovery"]
+    if intent:
+        if (recovery, package, base) != (intent["id"], intent["package"], intent["failed_operation"]):
+            raise Conflict("Recorded recovery takes priority over normal publication")
+    elif recovery:
+        raise Conflict("Recovery intent no longer exists")
+    state["pending"] = {"operation": operation, "package": package, "base": base,
+                        "recovery": recovery, "phase": "claimed", "remote": None}
+    return state
+
+
+def _pending(state: dict, operation: str) -> dict:
+    if not state["pending"] or state["pending"]["operation"] != operation:
+        raise Conflict("No matching pending operation")
+    return state["pending"]
+
+
+def sending(state: dict, operation: str) -> dict:
+    state = deepcopy(state)
+    pending = _pending(state, operation)
+    if pending["phase"] != "claimed":
+        raise Conflict("Already sent or unknown: query instead of replaying")
+    pending["phase"] = "sending"
+    return state
+
+
+def bind_remote(state: dict, operation: str, remote: str) -> dict:
+    state = deepcopy(state)
+    pending = _pending(state, operation)
+    if pending["remote"] not in (None, remote):
+        raise Conflict("Operation refers to another remote request")
+    pending["remote"] = remote
+    pending["phase"] = "in_progress"
+    return state
+
+
+def deployed(state: dict, operation: str, remote: str) -> dict:
+    state = bind_remote(state, operation, remote)
+    pending = state["pending"]
+    if current_id(state) == operation:
+        pending["phase"] = "confirming"
+        return state
+    old = state["current"]
+    if old and old.get("health") == "passed" and state["packages"].get(old["package"], {}).get("eligible"):
+        state["previous"] = deepcopy(old)
+    state["current"] = {"operation": operation, "package": pending["package"], "remote": remote, "health": "unknown"}
+    pending["phase"] = "confirming"
+    return state
+
+
+def confirmed(state: dict, operation: str, *, health: str, observed_operation: str) -> dict:
+    state = deepcopy(state)
+    pending = _pending(state, operation)
+    if health not in {"passed", "failed"} or current_id(state) != operation or observed_operation != operation:
+        raise Conflict("Confirmation must describe the actual selected deployment")
+    state["current"]["health"] = health
+    state["packages"][pending["package"]]["eligible"] = health == "passed"
+    if pending["recovery"] and health == "passed":
+        state["recovery"] = None
+    state["pending"] = None
+    return state
+
+
+def no_write(state: dict, operation: str, *, terminal_without_write: bool) -> dict:
+    state = deepcopy(state)
+    _pending(state, operation)
+    if not terminal_without_write or current_id(state) == operation:
+        raise Conflict("A missing record does not prove no write occurred")
+    state["pending"] = None
+    return state  # Queue cancellation does not clear recovery intent.
+
+
+def end_recovery(state: dict, intent: str, *, reason: str) -> dict:
+    state = deepcopy(state)
+    if state["pending"]:
+        raise Conflict("Resolve the actual remote write before clearing intent")
+    if not state["recovery"] or state["recovery"]["id"] != intent or not reason.strip():
+        raise Conflict("Specify the completed, withdrawn or invalid recovery intent")
+    state["recovery"] = None
+    return state
+
+
+def expired_packages(state: dict, now: datetime) -> list[str]:
+    protected = {value["package"] for key in ("current", "previous", "pending", "recovery") if (value := state.get(key))}
+    expired = []
+    for package, value in state["packages"].items():
+        if package in protected or value.get("active", True):
+            continue
+        started = value.get("published_at") or value.get("ended_at")
+        if not started:
+            continue
+        timestamp = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        days = 30 if value.get("published_at") else 7
+        if now.astimezone(timezone.utc) >= timestamp + timedelta(days=days):
+            expired.append(package)
+    return expired
