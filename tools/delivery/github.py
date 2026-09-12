@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import tempfile
 from urllib.parse import quote
 
 from tools.delivery import packages
-from tools.delivery.state import Conflict, initial
+from tools.delivery.state import Conflict, expired_packages, initial
 
 
 class APIError(RuntimeError):
@@ -135,6 +136,12 @@ class GitHub:
         for asset in release["assets"]:
             if asset.get("digest") and asset["digest"] != f"sha256:{expected[asset['name']]}":
                 raise APIError("Uploaded asset checksum differs")
+            if not asset.get("digest"):
+                with tempfile.TemporaryDirectory(prefix="archive-verify-") as temporary:
+                    self.command(["release", "download", identifier, "--repo", self.repository,
+                                  "--pattern", asset["name"], "--dir", temporary])
+                    if packages.sha256(Path(temporary) / asset["name"]) != expected[asset["name"]]:
+                        raise APIError("Uploaded asset checksum differs")
         if release["draft"]:
             release = self.api(f"repos/{self.repository}/releases/{release['id']}", method="PATCH", body={"draft": False})
         state, sha = self.load_state()
@@ -162,3 +169,34 @@ class GitHub:
             packages.verify(downloaded / "product.tar.gz", manifest, target=target)
             downloaded.rename(destination)
         return manifest
+
+    def prune(self, *, execute: bool = False) -> dict:
+        self.private()
+        state, _ = self.load_state()
+        candidates = expired_packages(state, datetime.now(timezone.utc))
+        if not execute:
+            return {"state": "preview", "expired": candidates}
+        removed = []
+        for identifier in candidates:
+            state, sha = self.load_state()
+            if identifier not in expired_packages(state, datetime.now(timezone.utc)):
+                continue
+            # Claim exclusion before deleting bytes. A concurrent publication
+            # changes the same state SHA; it cannot silently lose its package.
+            info = state["packages"][identifier]
+            info.update(complete=False, eligible=False, deleting=True)
+            self.save_state(state, sha)
+            release = self.release(identifier)
+            if release:
+                if release["id"] != info["release"]:
+                    raise APIError("Archive release identity changed during cleanup")
+                self.api(f"repos/{self.repository}/releases/{release['id']}", method="DELETE")
+            if self.release(identifier) is not None:
+                raise APIError("Release deletion is not yet confirmed; keep cleanup state")
+            state, sha = self.load_state()
+            if not state["packages"].get(identifier, {}).get("deleting"):
+                raise Conflict("Cleanup state changed; inspect the remaining archive reference")
+            del state["packages"][identifier]
+            self.save_state(state, sha)
+            removed.append(identifier)
+        return {"state": "cleaned", "removed": removed}

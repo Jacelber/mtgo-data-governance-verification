@@ -104,12 +104,20 @@ def prepare(site: Path, destination: Path, *, target: str, source: str) -> dict:
                         continue  # A new candidate gets a marker for its actual selected bytes.
                     relative = safe_name(path.relative_to(site).as_posix())
                     info = archive.gettarinfo(str(path), arcname="./" + relative)
-                    content_digest.update(relative.encode() + b"\0" + sha256(path).encode() + b"\0")
                     info.uid = info.gid = info.mtime = 0
                     info.uname = info.gname = ""
                     info.mode = 0o644
                     with path.open("rb") as handle:
-                        archive.addfile(info, handle)
+                        digest = hashlib.sha256()
+                        class SelectedBytes:
+                            def read(self, size=-1):
+                                data = handle.read(size)
+                                digest.update(data)
+                                return data
+                        archive.addfile(info, SelectedBytes())
+                        if handle.read(1):
+                            raise ValueError("Site changed while packaging; prepare a stable candidate")
+                        content_digest.update(relative.encode() + b"\0" + digest.hexdigest().encode() + b"\0")
                 marker = json.dumps({"content_sha256": content_digest.hexdigest()}, sort_keys=True).encode() + b"\n"
                 info = tarfile.TarInfo("./" + VERSION_FILE)
                 info.size, info.mode, info.mtime = len(marker), 0o644, 0

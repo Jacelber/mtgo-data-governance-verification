@@ -33,10 +33,12 @@ def main() -> int:
     request.add_argument("--base", default="")
     request.add_argument("--recovery", action="store_true")
     request.add_argument("--reason", default="")
+    request.add_argument("--automatic", action="store_true")
     claim = sub.add_parser("claim", help="Claim the target, retrieve the archived package, and extract it")
     claim.add_argument("--package", required=True)
     claim.add_argument("--base", default="")
     claim.add_argument("--recovery", action="store_true")
+    claim.add_argument("--automatic", action="store_true")
     claim.add_argument("--output", type=Path, required=True)
     send = sub.add_parser("send", help="Send once; a later failure resumes querying this operation")
     send.add_argument("--artifact-id", required=True, type=int)
@@ -58,6 +60,16 @@ def main() -> int:
         archive, pages = context(args.target)
         archive.private()
         state, sha = archive.load_state()
+        pending = state["pending"]
+        if (args.command in {"request", "claim"} and args.automatic and not args.recovery
+                and state.get("automatic_publication_pause")
+                and not (pending and pending["operation"] == args.operation and pending["phase"] != "claimed")):
+            # An intentional pause is a normal result, not a product/CI failure.
+            if output := os.environ.get("GITHUB_OUTPUT"):
+                with Path(output).open("a") as handle:
+                    handle.write("phase=paused\nallowed=false\n")
+            print(json.dumps({"state": "publication_paused", "pause": state["automatic_publication_pause"]}, ensure_ascii=False))
+            return 0
         if args.command == "request":
             info = state["packages"].get(args.package, {})
             if not info.get("complete") or info.get("target") != args.target:
@@ -66,7 +78,12 @@ def main() -> int:
                 state = transitions.request_recovery(state, intent=args.operation, failed_operation=args.base,
                                                      package=args.package, reason=args.reason)
                 archive.save_state(state, sha)
+            else:
+                transitions.require_publication_enabled(state, automatic=args.automatic)
             result = {"state": "requested", "operation": args.operation}
+            if output := os.environ.get("GITHUB_OUTPUT"):
+                with Path(output).open("a") as handle:
+                    handle.write("allowed=true\n")
         elif args.command == "claim":
             if state["packages"].get(args.package, {}).get("target") != args.target:
                 raise transitions.Conflict("Candidate belongs to a different deployment target")
@@ -79,7 +96,7 @@ def main() -> int:
                     raise transitions.Conflict("An existing live deployment requires an explicit initial baseline")
             updated = transitions.claim(state, operation=args.operation, package=args.package, base=args.base or None,
                                         recovery=(state["pending"]["recovery"] if state["pending"] and state["pending"]["operation"] == args.operation
-                                                  else args.operation if args.recovery else None))
+                                                  else args.operation if args.recovery else None), automatic=args.automatic)
             old = state["pending"]
             run, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
             if old and old["phase"] == "claimed" and (old.get("run"), old.get("attempt")) != (run, attempt):
@@ -152,6 +169,7 @@ def main() -> int:
             else:
                 state["current"]["health"] = "failed"
                 state["packages"][current["package"]]["eligible"] = False
+                state["packages"][current["package"]]["failed"] = True
             state["current"]["defect"] = args.reason
             archive.save_state(state, sha)
             result = {"state": "defect_recorded", "operation": args.operation}

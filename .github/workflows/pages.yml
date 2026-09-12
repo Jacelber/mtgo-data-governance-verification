@@ -1,10 +1,10 @@
-name: Verify selected product deployment
+name: Deploy or restore selected product
 run-name: ${{ inputs.operation }} (${{ inputs.mode }})
 on:
   workflow_dispatch:
     inputs:
       package:
-        description: Archived synthetic package
+        description: Exact archived product package
         required: true
         type: string
       operation:
@@ -24,18 +24,25 @@ on:
         description: Concrete recovery reason when applicable
         type: string
         default: ''
+      automatic:
+        description: Unattended publication; false only for an explicitly authorized task publication
+        type: boolean
+        default: true
 permissions:
   contents: read
 jobs:
   request:
-    if: inputs.mode != 'resume'
+    if: github.ref == 'refs/heads/main' && inputs.mode != 'resume'
     runs-on: ubuntu-latest
     environment: product-archive
+    outputs:
+      allowed: ${{ steps.request.outputs.allowed }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
       - name: Register request before writer queue
+        id: request
         env:
           ARCHIVE_TOKEN: ${{ secrets.ARCHIVE_TOKEN }}
           PACKAGE: ${{ inputs.package }}
@@ -43,14 +50,16 @@ jobs:
           BASE: ${{ inputs.base }}
           MODE: ${{ inputs.mode }}
           REASON: ${{ inputs.reason }}
+          AUTOMATIC: ${{ inputs.automatic }}
         run: |
           flags=()
+          if [ "$AUTOMATIC" = true ]; then flags+=(--automatic); fi
           if [ "$MODE" = recovery ]; then flags+=(--recovery --reason "$REASON"); fi
           python tools/pages_writer.py --target Jacelber/mtgo-data-governance-verification --operation "$OPERATION" request --package "$PACKAGE" --base "$BASE" "${flags[@]}"
   deploy:
     name: Deploy selected product
     needs: request
-    if: ${{ !cancelled() && (needs.request.result == 'success' || inputs.mode == 'resume') }}
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && ((needs.request.result == 'success' && needs.request.outputs.allowed == 'true') || inputs.mode == 'resume') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: github-pages
@@ -70,6 +79,7 @@ jobs:
       OPERATION: ${{ inputs.operation }}
       BASE: ${{ inputs.base }}
       MODE: ${{ inputs.mode }}
+      AUTOMATIC: ${{ inputs.automatic }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -78,6 +88,7 @@ jobs:
         id: candidate
         run: |
           flags=()
+          if [ "$AUTOMATIC" = true ]; then flags+=(--automatic); fi
           if [ "$MODE" = recovery ]; then flags+=(--recovery); fi
           python tools/pages_writer.py --target Jacelber/mtgo-data-governance-verification --operation "$OPERATION" claim --package "$PACKAGE" --base "$BASE" --output "$RUNNER_TEMP/selected-transport" "${flags[@]}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -94,6 +105,7 @@ jobs:
           ARTIFACT_ID: ${{ steps.transport.outputs.artifact-id }}
         run: python tools/pages_writer.py --target Jacelber/mtgo-data-governance-verification --operation "$OPERATION" send --artifact-id "$ARTIFACT_ID"
       - name: Confirm existing remote operation and selected product
+        if: steps.candidate.outputs.phase != 'paused'
         env:
           CANDIDATE: ${{ steps.candidate.outputs.candidate }}
         run: python tools/pages_writer.py --target Jacelber/mtgo-data-governance-verification --operation "$OPERATION" resume --candidate "$CANDIDATE" --wait-seconds 50

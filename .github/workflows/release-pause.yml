@@ -1,0 +1,40 @@
+name: Verify Owner-directed automatic publication release
+on:
+  workflow_dispatch:
+    inputs:
+      recovery:
+        description: The synthetic recovery pause to release
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release-synthetic-pause
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: product-archive
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Release the synthetic pause without a deployment
+        env:
+          ARCHIVE_TOKEN: ${{ secrets.ARCHIVE_TOKEN }}
+          RECOVERY: ${{ inputs.recovery }}
+        run: |
+          python - <<'PY'
+          import os
+          from tools.pages_writer import context
+          from tools.delivery.state import enable_automatic_publication
+          archive, _ = context('Jacelber/mtgo-data-governance-verification')
+          archive.private()
+          state, sha = archive.load_state()
+          updated = enable_automatic_publication(state, recovery=os.environ['RECOVERY'], reason='Owner-authorized synthetic verification of explicit release')
+          assert updated['current'] == state['current'] and updated['pending'] is None
+          if updated != state:
+              archive.save_state(updated, sha)
+          print('Synthetic automatic publication enabled; no deployment requested')
+          PY

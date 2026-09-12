@@ -11,7 +11,7 @@ class Conflict(ValueError):
 
 def initial() -> dict:
     return {"schema": 1, "current": None, "previous": None, "pending": None,
-            "recovery": None, "packages": {}}
+            "recovery": None, "automatic_publication_pause": None, "packages": {}}
 
 
 def current_id(state: dict) -> str | None:
@@ -19,12 +19,12 @@ def current_id(state: dict) -> str | None:
 
 
 def request_recovery(state: dict, *, intent: str, failed_operation: str, package: str, reason: str) -> dict:
-    """Caller must also establish the policy's scope, permission and defect facts."""
+    """Execute an Owner-directed restore; the caller establishes that instruction."""
     state = deepcopy(state)
     current, previous = state["current"], state["previous"]
     if not reason.strip() or not current or current["operation"] != failed_operation:
-        raise Conflict("Recovery requires the current failed deployment and a concrete reason")
-    if current.get("health") != "failed" or not previous or previous["package"] != package:
+        raise Conflict("Recovery requires the selected current deployment and Owner instruction context")
+    if not previous or previous["package"] != package:
         raise Conflict("Recovery requires the immediately applicable confirmed predecessor")
     if not state["packages"].get(package, {}).get("eligible", False):
         raise Conflict("Recovery package is not applicable")
@@ -32,28 +32,54 @@ def request_recovery(state: dict, *, intent: str, failed_operation: str, package
     if state["recovery"] and state["recovery"] != recovery:
         raise Conflict("Another recovery intent exists")
     state["recovery"] = recovery
+    state["automatic_publication_pause"] = {"recovery": intent, "reason": reason}
     return state
 
 
-def claim(state: dict, *, operation: str, package: str, base: str | None, recovery: str | None = None) -> dict:
+def require_publication_enabled(state: dict, *, automatic: bool, recovery: str | None = None) -> None:
+    if automatic and not recovery and state.get("automatic_publication_pause"):
+        raise Conflict("Automatic publication is paused by Owner-directed recovery; preparation may continue")
+
+
+def enable_automatic_publication(state: dict, *, recovery: str, reason: str) -> dict:
+    """Caller establishes explicit Owner release or fulfilment of prior authorization."""
+    state = deepcopy(state)
+    if not reason.strip():
+        raise Conflict("Specify the Owner instruction or fulfilled prior authorization")
+    if state["pending"] or state["recovery"]:
+        raise Conflict("Resolve the pending write and recovery before enabling automatic publication")
+    pause = state.get("automatic_publication_pause")
+    if pause and pause["recovery"] != recovery:
+        raise Conflict("Release refers to a different recovery pause")
+    state["automatic_publication_pause"] = None
+    return state
+
+
+def claim(state: dict, *, operation: str, package: str, base: str | None, recovery: str | None = None,
+          automatic: bool = False) -> dict:
     state = deepcopy(state)
     pending = state["pending"]
     if pending:
         if (pending["operation"], pending["package"], pending["base"], pending["recovery"]) == (operation, package, base, recovery):
+            if pending["phase"] == "claimed":
+                require_publication_enabled(state, automatic=pending.get("automatic", True), recovery=pending["recovery"])
             return state  # Resume means query, not replay an unknown remote request.
         raise Conflict("An earlier remote write remains unresolved")
     if base != current_id(state):
         raise Conflict("Candidate deployment base is stale, including A-B-A")
     if not state["packages"].get(package, {}).get("complete", False):
         raise Conflict("Package is not fully archived")
+    if state["packages"][package].get("failed"):
+        raise Conflict("This exact package has a confirmed defect; fix it before publication")
     intent = state["recovery"]
     if intent:
         if (recovery, package, base) != (intent["id"], intent["package"], intent["failed_operation"]):
             raise Conflict("Recorded recovery takes priority over normal publication")
     elif recovery:
         raise Conflict("Recovery intent no longer exists")
+    require_publication_enabled(state, automatic=automatic, recovery=recovery)
     state["pending"] = {"operation": operation, "package": package, "base": base,
-                        "recovery": recovery, "phase": "claimed", "remote": None}
+                        "recovery": recovery, "automatic": automatic, "phase": "claimed", "remote": None}
     return state
 
 
@@ -68,6 +94,10 @@ def sending(state: dict, operation: str) -> dict:
     pending = _pending(state, operation)
     if pending["phase"] != "claimed":
         raise Conflict("Already sent or unknown: query instead of replaying")
+    intent = state["recovery"]
+    if intent and pending["recovery"] != intent["id"]:
+        raise Conflict("An Owner recovery request supersedes this unsent publication")
+    require_publication_enabled(state, automatic=pending.get("automatic", True), recovery=pending["recovery"])
     pending["phase"] = "sending"
     return state
 
@@ -89,9 +119,10 @@ def deployed(state: dict, operation: str, remote: str) -> dict:
         pending["phase"] = "confirming"
         return state
     old = state["current"]
-    if old and old.get("health") == "passed" and state["packages"].get(old["package"], {}).get("eligible"):
+    if not pending["recovery"] and old and old.get("health") == "passed" and state["packages"].get(old["package"], {}).get("eligible"):
         state["previous"] = deepcopy(old)
     state["current"] = {"operation": operation, "package": pending["package"], "remote": remote, "health": "unknown"}
+    state["packages"][pending["package"]].setdefault("published_at", datetime.now(timezone.utc).isoformat())
     pending["phase"] = "confirming"
     return state
 
@@ -103,6 +134,7 @@ def confirmed(state: dict, operation: str, *, health: str, observed_operation: s
         raise Conflict("Confirmation must describe the actual selected deployment")
     state["current"]["health"] = health
     state["packages"][pending["package"]]["eligible"] = health == "passed"
+    state["packages"][pending["package"]]["failed"] = health == "failed"
     if pending["recovery"] and health == "passed":
         state["recovery"] = None
     state["pending"] = None
@@ -142,3 +174,16 @@ def expired_packages(state: dict, now: datetime) -> list[str]:
         if now.astimezone(timezone.utc) >= timestamp + timedelta(days=days):
             expired.append(package)
     return expired
+
+
+def end_candidate(state: dict, package: str, *, reason: str) -> dict:
+    """Caller establishes that no active review or diagnosis still needs it."""
+    state = deepcopy(state)
+    if package not in state["packages"] or not reason.strip():
+        raise Conflict("Specify the candidate and its actual completion/cancellation reason")
+    if any(value and value["package"] == package for value in (state["pending"], state["recovery"])):
+        raise Conflict("The candidate is still involved in an unresolved operation")
+    info = state["packages"][package]
+    info["active"] = False
+    info.setdefault("ended_at", datetime.now(timezone.utc).isoformat())
+    return state
