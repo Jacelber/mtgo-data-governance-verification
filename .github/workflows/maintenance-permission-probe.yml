@@ -1,0 +1,11 @@
+name: Isolated maintenance permission probe
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [maintenance-verification]
+permissions: {}
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo isolated-permission-probe
